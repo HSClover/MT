@@ -7,10 +7,8 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-# ---------------------------------------------------------------------------
-# 전역 설정 변수
-# ---------------------------------------------------------------------------
-SAMPLES = 1000   # 추출할 무작위 영상 개수 (전체 처리 시 None)
+# 전역 변수
+SAMPLES = None   # 추출할 무작위 영상 개수 (전체 처리 시 None)
 BATCH = 256      # 배치 단위
 RANDOM_SEED = 42
 
@@ -19,11 +17,10 @@ PROJECT_ROOT = MODULES_DIR.parent.parent
 
 class YOLOJointTracker:
     def __init__(self, model_name="yolov8x-pose.pt"):
-        # RTX 5080 CUDA 디바이스 자동 설정
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"[*] 추론 디바이스 설정: {self.device} (GPU: {torch.cuda.get_device_name(0) if self.device == 'cuda' else 'None'})")
         
-        # YOLOv8 Pose 모델 가동 (최초 실행 시 자동 다운로드)
+        # YOLOv8 Pose 모델 로드
         self.model = YOLO(model_name)
         self.model.to(self.device)
 
