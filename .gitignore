@@ -1,3 +1,4 @@
-/data/
 /venv/
+/data/processed/
+/data/raw/*.zip
 *.pt
