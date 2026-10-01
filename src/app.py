@@ -4,7 +4,7 @@ import json
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
@@ -14,6 +14,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from ultralytics import YOLO
 
+# 1. 경로 및 설정
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODEL_SAVE_DIR = PROJECT_ROOT / "models"
 LABEL_MAP_PATH = MODEL_SAVE_DIR / "label_map.json"
@@ -28,6 +29,7 @@ CONFIDENCE_THRESHOLD = 0.65
 app = FastAPI()
 
 
+# 2. 신경망 모델 정의
 class TemporalAttention(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -80,6 +82,7 @@ class SignLanguageClassifier(nn.Module):
         return out
 
 
+# 3. 데이터 전처리 함수
 def normalize_keypoints(kpts: np.ndarray) -> np.ndarray:
     normalized = kpts.copy()
     num_frames = len(normalized)
@@ -111,6 +114,7 @@ def extract_features_with_velocity(kpts: np.ndarray) -> np.ndarray:
     return combined
 
 
+# 4. 아이패드 실시간 스트리밍 HTML UI
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -118,19 +122,29 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>iPad 수어 번역 시연</title>
     <style>
-        body { margin: 0; background-color: #0f172a; color: white; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
-        .container { position: relative; width: 90vw; max-width: 960px; background: #1e293b; border-radius: 20px; overflow: hidden; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5); }
-        img { width: 100%; display: block; }
+        body { margin: 0; background-color: #0f172a; color: white; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
+        .container { position: relative; width: 92vw; max-width: 960px; background: #1e293b; border-radius: 20px; overflow: hidden; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5); }
+        .img-wrapper { position: relative; width: 100%; padding-top: 56.25%; background: #000; }
+        #stream { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
         .overlay { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(10px); padding: 20px; border-top: 1px solid rgba(255, 255, 255, 0.1); }
-        .words-title { font-size: 14px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
-        .words { font-size: 20px; color: #38bdf8; margin-bottom: 10px; font-weight: 600; }
-        .sentence-title { font-size: 14px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
-        .sentence { font-size: 28px; color: #4ade80; font-weight: bold; }
+        .words-title { font-size: 13px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
+        .words { font-size: 20px; color: #38bdf8; margin-bottom: 10px; font-weight: 600; min-height: 28px; }
+        .sentence-title { font-size: 13px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
+        .sentence { font-size: 26px; color: #4ade80; font-weight: bold; min-height: 36px; }
+        .status-badge { position: absolute; top: 15px; left: 15px; z-index: 10; background: rgba(0, 0, 0, 0.6); backdrop-filter: blur(5px); padding: 6px 12px; border-radius: 20px; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
+        .dot.online { background: #22c55e; }
     </style>
 </head>
 <body>
     <div class="container">
-        <img id="stream" src="" alt="Live Feed">
+        <div class="status-badge">
+            <div class="dot" id="dot"></div>
+            <span id="status-text">연결 중...</span>
+        </div>
+        <div class="img-wrapper">
+            <img id="stream" alt="Live Feed">
+        </div>
         <div class="overlay">
             <div class="words-title">Detected Glosses</div>
             <div class="words" id="words">대기 중...</div>
@@ -139,12 +153,37 @@ HTML_TEMPLATE = """
         </div>
     </div>
     <script>
-        const ws = new WebSocket(`ws://${location.host}/ws`);
+        const streamImg = document.getElementById("stream");
+        const wordsDiv = document.getElementById("words");
+        const sentenceDiv = document.getElementById("sentence");
+        const dot = document.getElementById("dot");
+        const statusText = document.getElementById("status-text");
+
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        const ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+            dot.classList.add("online");
+            statusText.innerText = "LIVE STREAM";
+        };
+
         ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            document.getElementById("stream").src = "data:image/jpeg;base64," + data.image;
-            document.getElementById("words").innerText = data.words || "-";
-            document.getElementById("sentence").innerText = data.sentence || "...";
+            try {
+                const data = JSON.parse(event.data);
+                if (data.image) {
+                    streamImg.src = "data:image/jpeg;base64," + data.image;
+                }
+                wordsDiv.innerText = data.words || "-";
+                sentenceDiv.innerText = data.sentence || "...";
+            } catch (e) {
+                console.error("JSON 파싱 오류:", e);
+            }
+        };
+
+        ws.onclose = () => {
+            dot.classList.remove("online");
+            statusText.innerText = "연결 끊김";
         };
     </script>
 </body>
@@ -162,6 +201,11 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    if not LABEL_MAP_PATH.exists() or not CLASSIFIER_MODEL_PATH.exists():
+        await websocket.close(code=1008, reason="Model file missing")
+        return
+
     with open(LABEL_MAP_PATH, "r", encoding="utf-8") as f:
         id2label_raw = json.load(f)
         id2label: Dict[int, str] = {int(k): str(v) for k, v in id2label_raw.items()}
@@ -171,7 +215,17 @@ async def websocket_endpoint(websocket: WebSocket):
     classifier.eval()
 
     yolo_model = YOLO("yolov8x-pose.pt")
+    
+    # 0번 캠 오픈 (장치 열기 시도)
     cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[!] 백엔드 카메라(0번)를 열 수 없습니다.")
+        await websocket.close(code=1011, reason="Camera opening failed")
+        return
+
+    # 카메라 해상도 및 FPS 비동기 최적화
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     frame_buffer: deque = deque(maxlen=SLIDING_WINDOW_SIZE)
     detected_words: deque = deque(maxlen=5)
@@ -182,7 +236,8 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             ret, frame = cap.read()
             if not ret or frame is None:
-                break
+                await asyncio.sleep(0.01)
+                continue
 
             frame = cv2.flip(frame, 1)
             results: Any = yolo_model(frame, verbose=False)
@@ -202,7 +257,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             y_val = float(pt[1])
                             conf = float(pt[2])
                             if conf > 0.5:
-                                cv2.circle(frame, (int(x_val), int(y_val)), 5, (56, 189, 248), -1)
+                                cv2.circle(frame, (int(x_val), int(y_val)), 4, (56, 189, 248), -1)
 
             frame_buffer.append(kpt_vector)
             frame_count += 1
@@ -228,7 +283,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             detected_words.append(word)
                             current_sentence = " ".join(list(detected_words)) + "."
 
-            _, buffer = cv2.imencode('.jpg', frame)
+            # JPEG 화질 조정(80%) 및 base64 전송
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+            _, buffer = cv2.imencode('.jpg', frame, encode_param)
             jpg_as_text = base64.b64encode(buffer).decode('utf-8')
 
             await websocket.send_json({
@@ -236,10 +293,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 "words": " ".join(list(detected_words)),
                 "sentence": current_sentence
             })
+            
+            # 이벤트 루프 제어권 넘기기 (비동기 병목 방지)
             await asyncio.sleep(0.01)
 
     except WebSocketDisconnect:
-        print("[*] 아이패드 웹 연결 해제")
+        print("[*] 아이패드 WebSocket 연결 정상 해제")
+    except Exception as e:
+        print(f"[!] 스트리밍 중 예외 발생: {e}")
     finally:
         cap.release()
 

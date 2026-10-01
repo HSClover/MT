@@ -20,7 +20,7 @@ MODEL_SAVE_DIR = PROJECT_ROOT / "models"
 LABEL_MAP_PATH = MODEL_SAVE_DIR / "label_map.json"
 CLASSIFIER_MODEL_PATH = MODEL_SAVE_DIR / "sign_word_model.pt"
 
-# 2. 전역 하이퍼파라미터
+# 2. 전역 변수
 FIXED_SEQ_LEN = 30
 INPUT_DIM = 102
 SLIDING_WINDOW_SIZE = 30
