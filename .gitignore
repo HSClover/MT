@@ -1,4 +1,7 @@
 /venv/
 /data/processed/
 /data/raw/
-*.pt
+*.pt*.pth
+__pycache__/
+*.py[cod]
+.venv/

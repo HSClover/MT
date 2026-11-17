@@ -4,12 +4,23 @@ from pathlib import Path
 # ==========================================
 # 1. 프로젝트 기본 경로 설정 (Pathlib 기반)
 # ==========================================
-# config.py 파일의 위치 기준 상위 디렉토리를 BASE_DIR로 설정
+# config.py가 src/config.py에 위치할 경우, parent.parent는 최상위 루트(MT/)를 가리킵니다.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 RAW_DATA_DIR = BASE_DIR / "data" / "raw"
 PROCESSED_DATA_DIR = BASE_DIR / "data" / "processed"
-WEIGHTS_DIR = BASE_DIR / "weights"
+
+# [수정] 실제 폴더 이름인 'models'에 맞게 수정
+MODELS_DIR = BASE_DIR / "models"
+
+# ==========================================
+# 1-1. 세부 모델 파일 경로 추가
+# ==========================================
+HAND_LANDMARKER_PATH = MODELS_DIR / "hand_landmarker.task"
+POSE_LANDMARKER_PATH = MODELS_DIR / "pose_landmarker_full.task"
+YOLO_MODEL_PATH = MODELS_DIR / "yolov8x-pose.pt"
+SIGN_MODEL_PATH = MODELS_DIR / "sign_word_model.pt"
+LABEL_MAP_PATH = MODELS_DIR / "label_map.json"
 
 # ==========================================
 # 2. 1단계 (Tracker) 데이터 전처리 옵션

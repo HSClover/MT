@@ -1,3 +1,4 @@
+import sys
 import asyncio
 import base64
 import json
@@ -14,11 +15,24 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from ultralytics import YOLO
 
-# 1. 경로 및 설정
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MODEL_SAVE_DIR = PROJECT_ROOT / "models"
-LABEL_MAP_PATH = MODEL_SAVE_DIR / "label_map.json"
-CLASSIFIER_MODEL_PATH = MODEL_SAVE_DIR / "sign_word_model.pt"
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    from src.config import (
+        YOLO_MODEL_PATH,
+        SIGN_MODEL_PATH,
+        LABEL_MAP_PATH
+    )
+except ImportError:
+    from config import (
+        YOLO_MODEL_PATH,
+        SIGN_MODEL_PATH,
+        LABEL_MAP_PATH
+    )
 
 FIXED_SEQ_LEN = 30
 INPUT_DIM = 102
@@ -29,7 +43,6 @@ CONFIDENCE_THRESHOLD = 0.65
 app = FastAPI()
 
 
-# 2. 신경망 모델 정의
 class TemporalAttention(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -82,7 +95,6 @@ class SignLanguageClassifier(nn.Module):
         return out
 
 
-# 3. 데이터 전처리 함수
 def normalize_keypoints(kpts: np.ndarray) -> np.ndarray:
     normalized = kpts.copy()
     num_frames = len(normalized)
@@ -114,7 +126,6 @@ def extract_features_with_velocity(kpts: np.ndarray) -> np.ndarray:
     return combined
 
 
-# 4. 아이패드 실시간 스트리밍 HTML UI
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -202,7 +213,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    if not LABEL_MAP_PATH.exists() or not CLASSIFIER_MODEL_PATH.exists():
+    if not LABEL_MAP_PATH.exists() or not SIGN_MODEL_PATH.exists():
         await websocket.close(code=1008, reason="Model file missing")
         return
 
@@ -211,19 +222,17 @@ async def websocket_endpoint(websocket: WebSocket):
         id2label: Dict[int, str] = {int(k): str(v) for k, v in id2label_raw.items()}
 
     classifier = SignLanguageClassifier(input_dim=INPUT_DIM, num_classes=len(id2label)).to(device)
-    classifier.load_state_dict(torch.load(CLASSIFIER_MODEL_PATH, map_location=device))
+    classifier.load_state_dict(torch.load(SIGN_MODEL_PATH, map_location=device))
     classifier.eval()
 
-    yolo_model = YOLO("yolov8x-pose.pt")
+    yolo_model = YOLO(str(YOLO_MODEL_PATH))
     
-    # 0번 캠 오픈 (장치 열기 시도)
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("[!] 백엔드 카메라(0번)를 열 수 없습니다.")
         await websocket.close(code=1011, reason="Camera opening failed")
         return
 
-    # 카메라 해상도 및 FPS 비동기 최적화
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
@@ -283,7 +292,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             detected_words.append(word)
                             current_sentence = " ".join(list(detected_words)) + "."
 
-            # JPEG 화질 조정(80%) 및 base64 전송
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
             _, buffer = cv2.imencode('.jpg', frame, encode_param)
             jpg_as_text = base64.b64encode(buffer).decode('utf-8')
@@ -294,7 +302,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 "sentence": current_sentence
             })
             
-            # 이벤트 루프 제어권 넘기기 (비동기 병목 방지)
             await asyncio.sleep(0.01)
 
     except WebSocketDisconnect:

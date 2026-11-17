@@ -12,15 +12,31 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import ImageFont, ImageDraw, Image
 from ultralytics import YOLO
 
-# 1. 경로 설정
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MODEL_SAVE_DIR = PROJECT_ROOT / "models"
-LABEL_MAP_PATH = MODEL_SAVE_DIR / "label_map.json"
-CLASSIFIER_MODEL_PATH = MODEL_SAVE_DIR / "sign_word_model.pt"
+# 루트 및 src 경로 추가
+PROJECT_ROOT = Path(__file__).resolve().parent
+SRC_DIR = PROJECT_ROOT / "src"
 
-# 2. 전역 변수
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+try:
+    from src.config import (
+        YOLO_MODEL_PATH,
+        SIGN_MODEL_PATH,
+        LABEL_MAP_PATH
+    )
+except ImportError:
+    from config import (
+        YOLO_MODEL_PATH,
+        SIGN_MODEL_PATH,
+        LABEL_MAP_PATH
+    )
+
 FIXED_SEQ_LEN = 30
 INPUT_DIM = 102
 SLIDING_WINDOW_SIZE = 30
@@ -28,7 +44,6 @@ SLIDING_STEP = 5
 CONFIDENCE_THRESHOLD = 0.65
 
 
-# 3. 모델 클래스 정의
 class TemporalAttention(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -81,7 +96,6 @@ class SignLanguageClassifier(nn.Module):
         return out
 
 
-# 4. 전처리 및 특징 추출 함수
 def normalize_keypoints(kpts: np.ndarray) -> np.ndarray:
     normalized = kpts.copy()
     num_frames = len(normalized)
@@ -113,7 +127,20 @@ def extract_features_with_velocity(kpts: np.ndarray) -> np.ndarray:
     return combined
 
 
-# 5. 비동기 문맥 정제 스레드
+def draw_korean_text(img, text, position, font_size=24, color=(255, 255, 255)):
+    """PIL을 활용한 OpenCV 이미지 상 한글 출력 유틸리티"""
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    
+    try:
+        font = ImageFont.truetype("malgun.ttf", font_size) # Windows 기본 폰트
+    except IOError:
+        font = ImageFont.load_default()
+        
+    draw.text(position, text, font=font, fill=color)
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+
 class AsyncRefiner:
     def __init__(self):
         self.word_queue: queue.Queue = queue.Queue()
@@ -142,12 +169,11 @@ class AsyncRefiner:
                     recent_words.clear()
 
 
-# 6. 메인 실시간 추론 루프
 def run_realtime_system():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[*] 추론 디바이스: {device} ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})")
 
-    if not LABEL_MAP_PATH.exists() or not CLASSIFIER_MODEL_PATH.exists():
+    if not LABEL_MAP_PATH.exists() or not SIGN_MODEL_PATH.exists():
         print("[!] 학습된 모델 파일 또는 label_map.json이 존재하지 않습니다.")
         return
 
@@ -157,10 +183,10 @@ def run_realtime_system():
 
     num_classes = len(id2label)
     classifier = SignLanguageClassifier(input_dim=INPUT_DIM, num_classes=num_classes).to(device)
-    classifier.load_state_dict(torch.load(CLASSIFIER_MODEL_PATH, map_location=device))
+    classifier.load_state_dict(torch.load(SIGN_MODEL_PATH, map_location=device))
     classifier.eval()
 
-    yolo_model = YOLO("yolov8x-pose.pt")
+    yolo_model = YOLO(str(YOLO_MODEL_PATH))
     refiner = AsyncRefiner()
 
     cap = cv2.VideoCapture(0)
@@ -190,7 +216,7 @@ def run_realtime_system():
                 kpts_obj = first_res.keypoints
                 if hasattr(kpts_obj, "data") and kpts_obj.data is not None and len(kpts_obj.data) > 0:
                     kpts_tensor = kpts_obj.data[0]
-                    kpts_data = kpts_tensor.cpu().numpy()  # (17, 3)
+                    kpts_data = kpts_tensor.cpu().numpy()
                     kpt_vector = kpts_data.flatten()
                     
                     for pt in kpts_data:
@@ -224,15 +250,15 @@ def run_realtime_system():
                         detected_words_history.append(pred_word)
                         refiner.add_word(pred_word)
 
-        # UI 오버레이
+        # UI 오버레이 (한글 렌더링 지원)
         h, w, _ = frame.shape
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, h - 100), (w, h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
         words_str = " ".join(list(detected_words_history))
-        cv2.putText(frame, f"Words: {words_str}", (20, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        cv2.putText(frame, f"Sentence: {refiner.current_sentence}", (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        frame = draw_korean_text(frame, f"단어: {words_str}", (20, h - 80), font_size=20, color=(0, 255, 255))
+        frame = draw_korean_text(frame, f"문장: {refiner.current_sentence}", (20, h - 40), font_size=24, color=(74, 222, 128))
 
         cv2.imshow("Real-Time Sign Language Translator", frame)
 
