@@ -10,7 +10,6 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from ultralytics import YOLO
@@ -27,12 +26,16 @@ try:
         SIGN_MODEL_PATH,
         LABEL_MAP_PATH
     )
+    from src.modules.model import SignLanguageClassifier
+    from src.modules.features import normalize_keypoints, extract_features_with_velocity
 except ImportError:
     from config import (
         YOLO_MODEL_PATH,
         SIGN_MODEL_PATH,
         LABEL_MAP_PATH
     )
+    from modules.model import SignLanguageClassifier
+    from modules.features import normalize_keypoints, extract_features_with_velocity
 
 FIXED_SEQ_LEN = 30
 INPUT_DIM = 102
@@ -41,89 +44,6 @@ SLIDING_STEP = 5
 CONFIDENCE_THRESHOLD = 0.65
 
 app = FastAPI()
-
-
-class TemporalAttention(nn.Module):
-    def __init__(self, hidden_dim: int):
-        super().__init__()
-        self.attn = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, lstm_output: torch.Tensor) -> torch.Tensor:
-        attn_weights = self.attn(lstm_output)
-        attn_weights = torch.softmax(attn_weights, dim=1)
-        context = torch.sum(attn_weights * lstm_output, dim=1)
-        return context
-
-
-class SignLanguageClassifier(nn.Module):
-    def __init__(self, input_dim: int = INPUT_DIM, num_classes: int = 100, hidden_dim: int = 128):
-        super().__init__()
-        self.conv1 = nn.Conv1d(in_channels=input_dim, out_channels=64, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.relu = nn.ReLU()
-        
-        self.lstm = nn.LSTM(
-            input_size=64,
-            hidden_size=hidden_dim,
-            num_layers=2,
-            batch_first=True,
-            bidirectional=True
-        )
-        
-        self.attention = TemporalAttention(hidden_dim * 2)
-        
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim * 2, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.permute(0, 2, 1)
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = x.permute(0, 2, 1)
-        
-        lstm_out, _ = self.lstm(x)
-        context = self.attention(lstm_out)
-        
-        out = self.fc(context)
-        return out
-
-
-def normalize_keypoints(kpts: np.ndarray) -> np.ndarray:
-    normalized = kpts.copy()
-    num_frames = len(normalized)
-    
-    for f in range(num_frames):
-        frame_data = normalized[f].reshape(17, 3)
-        left_shoulder = frame_data[5, :2]
-        right_shoulder = frame_data[6, :2]
-        
-        if frame_data[5, 2] > 0.1 and frame_data[6, 2] > 0.1:
-            center = (left_shoulder + right_shoulder) / 2.0
-            scale = float(np.linalg.norm(left_shoulder - right_shoulder))
-            if scale < 1e-5:
-                scale = 1.0
-        else:
-            center = np.mean(frame_data[:, :2], axis=0)
-            scale = 1.0
-
-        frame_data[:, :2] = (frame_data[:, :2] - center) / scale
-        normalized[f] = frame_data.flatten()
-        
-    return normalized
-
-
-def extract_features_with_velocity(kpts: np.ndarray) -> np.ndarray:
-    velocity = np.zeros_like(kpts)
-    velocity[1:] = kpts[1:] - kpts[:-1]
-    combined = np.concatenate([kpts, velocity], axis=-1)
-    return combined
 
 
 HTML_TEMPLATE = """
