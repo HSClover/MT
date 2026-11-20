@@ -1,7 +1,5 @@
-import os
 import sys
 import json
-import time
 from pathlib import Path
 from collections import Counter
 from typing import Dict, List, Tuple
@@ -9,148 +7,182 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 
-# 독립 실행 지원을 위한 sys.path 추가
 CURRENT_DIR = Path(__file__).resolve().parent
-SRC_DIR = CURRENT_DIR.parent
-PROJECT_ROOT = SRC_DIR.parent
-
+PROJECT_ROOT = CURRENT_DIR.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-try:
-    from src.config import (
-        PROCESSED_DATA_DIR,
-        MODELS_DIR,
-        SIGN_MODEL_PATH,
-        LABEL_MAP_PATH,
-        WORD_CLASSIFIER_EPOCHS,
-        WORD_CLASSIFIER_BATCH_SIZE,
-        LEARNING_RATE
-    )
-    from src.modules.model import SignLanguageClassifier
-    from src.modules.features import normalize_keypoints, extract_features_with_velocity
-except ImportError:
-    from config import (
-        PROCESSED_DATA_DIR,
-        MODELS_DIR,
-        SIGN_MODEL_PATH,
-        LABEL_MAP_PATH,
-        WORD_CLASSIFIER_EPOCHS,
-        WORD_CLASSIFIER_BATCH_SIZE,
-        LEARNING_RATE
-    )
-    from modules.model import SignLanguageClassifier
-    from modules.features import normalize_keypoints, extract_features_with_velocity
+from src.config import (
+    PROCESSED_DATA_DIR,
+    MODELS_DIR,
+    SIGN_MODEL_PATH,
+    LABEL_MAP_PATH,
+    FIXED_SEQ_LEN,
+    INPUT_DIM,
+    WORD_CLASSIFIER_EPOCHS,
+    WORD_CLASSIFIER_BATCH_SIZE,
+    LEARNING_RATE,
+    RANDOM_SEED,
+)
 
 MERGED_JSON_PATH = PROCESSED_DATA_DIR / "merged_nikl_data.json"
-FIXED_SEQ_LEN = 30       # 시퀀스 길이 (30 프레임)
-INPUT_DIM = 102          # 17개 관절 x 3D 좌표 + 속도 벡터 = 102차원
 HIDDEN_DIM = 128
 
-# 시험 실행용 상한 (0 = 제한 없음). 예: set MT_MAX_VIDEOS=3000
-MAX_TRAIN_VIDEOS = int(os.environ.get("MT_MAX_VIDEOS", "0"))
-VAL_SPLIT_RATIO = float(os.environ.get("MT_VAL_RATIO", "0.1"))
-RANDOM_SEED = 42
-WORD_CLASSIFIER_EPOCHS = int(os.environ.get("MT_EPOCHS", str(WORD_CLASSIFIER_EPOCHS)))
-WORD_CLASSIFIER_BATCH_SIZE = int(os.environ.get("MT_BATCH", str(WORD_CLASSIFIER_BATCH_SIZE)))
+
+class TemporalAttention(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, lstm_output: torch.Tensor) -> torch.Tensor:
+        attn_weights = torch.softmax(self.attn(lstm_output), dim=1)
+        return torch.sum(attn_weights * lstm_output, dim=1)
 
 
-# 1. 데이터셋 클래스
+class SignLanguageClassifier(nn.Module):
+    def __init__(self, input_dim: int = INPUT_DIM, num_classes: int = 100, hidden_dim: int = HIDDEN_DIM):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels=input_dim, out_channels=64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU()
+
+        self.lstm = nn.LSTM(
+            input_size=64,
+            hidden_size=hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.attention = TemporalAttention(hidden_dim * 2)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 1)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = x.permute(0, 2, 1)
+
+        lstm_out, _ = self.lstm(x)
+        context = self.attention(lstm_out)
+        return self.fc(context)
+
+
 class SignDataset(Dataset):
     def __init__(self, features: List[np.ndarray], labels: List[int]):
         self.features = [torch.tensor(f, dtype=torch.float32) for f in features]
         self.labels = [torch.tensor(l, dtype=torch.long) for l in labels]
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.labels)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         return self.features[idx], self.labels[idx]
 
 
-# 2. 실 데이터 매핑 및 파싱 함수
-def load_and_process_merged_data() -> Tuple[List[np.ndarray], List[int], Dict[str, int], List[str]]:
-    print(f"[*] 병합 데이터셋 로딩 중: {MERGED_JSON_PATH}")
+def normalize_keypoints(kpts: np.ndarray) -> np.ndarray:
+    """양어깨(인덱스 5, 6) 중심 및 어깨 너비 기준으로 좌표 정규화"""
+    normalized = kpts.copy()
+    for f in range(len(normalized)):
+        frame_data = normalized[f].reshape(17, 3)
+        left_shoulder = frame_data[5, :2]
+        right_shoulder = frame_data[6, :2]
+
+        if frame_data[5, 2] > 0.1 and frame_data[6, 2] > 0.1:
+            center = (left_shoulder + right_shoulder) / 2.0
+            scale = float(np.linalg.norm(left_shoulder - right_shoulder))
+            if scale < 1e-5:
+                scale = 1.0
+        else:
+            center = np.mean(frame_data[:, :2], axis=0)
+            scale = 1.0
+
+        frame_data[:, :2] = (frame_data[:, :2] - center) / scale
+        normalized[f] = frame_data.flatten()
+    return normalized
+
+
+def extract_features_with_velocity(kpts: np.ndarray) -> np.ndarray:
+    """정규화된 51차원 좌표에 프레임 간 속도(51차원)를 결합해 102차원 특징 생성"""
+    velocity = np.zeros_like(kpts)
+    if len(kpts) > 1:
+        velocity[1:] = kpts[1:] - kpts[:-1]
+    return np.concatenate([kpts, velocity], axis=-1)
+
+
+def load_and_process_merged_data() -> Tuple[List[np.ndarray], List[int], Dict[str, int]]:
     if not MERGED_JSON_PATH.exists():
-        raise FileNotFoundError(f"[!] 병합 파일이 존재하지 않습니다: {MERGED_JSON_PATH}")
+        raise FileNotFoundError(f"[!] 병합 파일이 없습니다: {MERGED_JSON_PATH} (merge_json.py 먼저 실행)")
 
     with open(MERGED_JSON_PATH, "r", encoding="utf-8") as f:
         merged_data = json.load(f)
 
-    raw_samples = []
-    word_counter = Counter()
+    raw_samples: List[Tuple[np.ndarray, str]] = []
+    word_counter: Counter = Counter()
+    matched_npy_count = 0
 
-    print(f"[v] 데이터셋 파싱 및 실제 .npy 키포인트 매핑 시작...")
-
-    all_items = list(merged_data.items())
-    if MAX_TRAIN_VIDEOS and len(all_items) > MAX_TRAIN_VIDEOS:
-        print(f"[*] 시험 실행: 원본 영상 {len(all_items)}개 중 상위 {MAX_TRAIN_VIDEOS}개만 사용")
-        all_items = all_items[:MAX_TRAIN_VIDEOS]
-
-    for file_stem, item in tqdm(all_items, desc="[실데이터 특징 추출]"):
+    for file_stem, item in tqdm(merged_data.items(), desc="[실데이터 .npy 매핑]"):
         npy_path = PROCESSED_DATA_DIR / f"{file_stem}.npy"
-        
-        # 실제 키포인트 추출 파일이 없는 경우 건너뀀
         if not npy_path.exists():
             continue
 
         try:
-            full_kpts = np.load(npy_path) # (Frames, 51)
+            full_kpts = np.load(npy_path)  # (Frames, 51)
         except Exception:
             continue
 
-        if len(full_kpts) == 0:
+        if full_kpts.ndim != 2 or len(full_kpts) == 0:
             continue
 
+        matched_npy_count += 1
         content = item.get("content", {})
-        sign_script = content.get("sign_script", {})
-        gestures = sign_script.get("sign_gestures_strong", [])
-
-        if not gestures:
-            continue
-
-        fps = 30.0 # 기본 비디오 FPS
+        fps = float(content.get("metaData", {}).get("fps", 30.0) or 30.0)
+        gestures = content.get("sign_script", {}).get("sign_gestures_strong", [])
         total_frames = len(full_kpts)
 
         for g in gestures:
             gloss_id = g.get("gloss_id")
-            start_time = g.get("start", 0.0)
-            end_time = g.get("end", 0.0)
+            start_time = float(g.get("start", 0.0))
+            end_time = float(g.get("end", 0.0))
 
-            if gloss_id and end_time > start_time:
-                # 시작/종료 시간에 해당하는 프레임 인덱스 계산
-                start_frame = int(start_time * fps)
-                end_frame = int(end_time * fps)
+            if not gloss_id or end_time <= start_time:
+                continue
 
-                start_frame = max(0, min(start_frame, total_frames - 1))
-                end_frame = max(start_frame + 1, min(end_frame, total_frames))
+            start_frame = max(0, min(int(start_time * fps), total_frames - 1))
+            end_frame = max(start_frame + 1, min(int(end_time * fps), total_frames))
+            sub_kpts = full_kpts[start_frame:end_frame]
 
-                sub_kpts = full_kpts[start_frame:end_frame]
-                
-                if len(sub_kpts) == 0:
-                    continue
+            if len(sub_kpts) == 0:
+                continue
 
-                # 어깨 기준 정규화 후, 키포인트(51차원) + 속도(51차원) = 102차원 특징 생성
-                feat_102d = extract_features_with_velocity(normalize_keypoints(sub_kpts))
+            norm_kpts = normalize_keypoints(sub_kpts)
+            feat_102d = extract_features_with_velocity(norm_kpts)
 
-                # 고정 길이 FIXED_SEQ_LEN(30 프레임)으로 패딩/자르기
-                if len(feat_102d) < FIXED_SEQ_LEN:
-                    pad_len = FIXED_SEQ_LEN - len(feat_102d)
-                    feat_102d = np.pad(feat_102d, ((0, pad_len), (0, 0)), mode='constant')
-                else:
-                    feat_102d = feat_102d[:FIXED_SEQ_LEN]
+            if len(feat_102d) < FIXED_SEQ_LEN:
+                pad_len = FIXED_SEQ_LEN - len(feat_102d)
+                feat_102d = np.pad(feat_102d, ((0, pad_len), (0, 0)), mode="constant")
+            else:
+                feat_102d = feat_102d[:FIXED_SEQ_LEN]
 
-                raw_samples.append((feat_102d, gloss_id, file_stem))
-                word_counter[gloss_id] += 1
+            raw_samples.append((feat_102d, gloss_id))
+            word_counter[gloss_id] += 1
+
+    print(f"[*] 매칭된 .npy 파일 수: {matched_npy_count}개 | 추출된 단어 구간 수: {len(raw_samples)}개")
 
     if not raw_samples:
-        print("[!] .npy 데이터와 매핑된 유효 수어 단어 샘플을 찾지 못했습니다. tracker.py를 먼저 실행해주세요.")
-        return [], [], {}, []
+        print("[!] 학습할 유효 샘플이 없습니다. tracker.py로 .npy 키포인트를 먼저 추출해 주세요.")
+        return [], [], {}
 
-    # 상위 100개 빈도 단어 클래스 선별
     top_words = [w for w, _ in word_counter.most_common(100)]
     label2id = {w: i for i, w in enumerate(top_words)}
     id2label = {i: w for i, w in enumerate(top_words)}
@@ -159,115 +191,47 @@ def load_and_process_merged_data() -> Tuple[List[np.ndarray], List[int], Dict[st
     with open(LABEL_MAP_PATH, "w", encoding="utf-8") as f:
         json.dump(id2label, f, ensure_ascii=False, indent=2)
 
-    features = []
-    labels = []
-    video_ids = []
-    for feat, gloss, stem in raw_samples:
+    features, labels = [], []
+    for feat, gloss in raw_samples:
         if gloss in label2id:
             features.append(feat)
             labels.append(label2id[gloss])
-            video_ids.append(stem)
 
-    print(f"[v] 전처리 완료: 총 {len(features)}개 실제 학습 샘플, "
-          f"{len(label2id)}개 단어 클래스, {len(set(video_ids))}개 원본 영상")
-    return features, labels, label2id, video_ids
+    print(f"[v] 전처리 완료: {len(features)}개 샘플, {len(label2id)}개 클래스")
+    return features, labels, label2id
 
 
-# 5. 평가 유틸리티
-@torch.no_grad()
-def evaluate(model, loader, device, num_classes: int):
-    model.eval()
-    criterion = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    correct = 0
-    total = 0
-    class_correct = torch.zeros(num_classes, dtype=torch.long)
-    class_total = torch.zeros(num_classes, dtype=torch.long)
-
-    for batch_x, batch_y in loader:
-        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-        outputs = model(batch_x)
-        total_loss += criterion(outputs, batch_y).item() * batch_x.size(0)
-
-        preds = torch.argmax(outputs, dim=1)
-        correct += (preds == batch_y).sum().item()
-        total += batch_y.size(0)
-
-        classes, counts = torch.unique(batch_y, return_counts=True)
-        for c, n in zip(classes.tolist(), counts.tolist()):
-            mask = batch_y == c
-            class_total[c] += n
-            class_correct[c] += int((preds[mask] == c).sum().item())
-
-    model.train()
-    loss = total_loss / max(total, 1)
-    acc = 100.0 * correct / max(total, 1)
-    per_class = {c: 100.0 * int(class_correct[c].item()) / int(class_total[c].item())
-                 for c in range(num_classes) if int(class_total[c].item()) > 0}
-    return loss, acc, per_class
-
-
-# 6. 메인 학습 함수
 def train_word_classifier():
-    torch.manual_seed(RANDOM_SEED)
-    np.random.seed(RANDOM_SEED)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[*] 학습 디바이스: {device}")
 
-    features, labels, label2id, video_ids = load_and_process_merged_data()
-
+    features, labels, label2id = load_and_process_merged_data()
     if not features:
-        print("[!] 학습할 데이터가 없습니다.")
         return
 
-    # 원본 영상 단위로 학습/검증 분리 (같은 영상의 다른 단어가 검증 세트로 새면 정확도가 부풀려짐)
-    unique_videos = sorted(set(video_ids))
-    rng = np.random.default_rng(RANDOM_SEED)
-    rng.shuffle(unique_videos)
-    n_val_videos = max(1, int(len(unique_videos) * VAL_SPLIT_RATIO))
-    val_videos = set(unique_videos[:n_val_videos])
+    full_dataset = SignDataset(features, labels)
+    if len(full_dataset) >= 10:
+        val_size = max(1, int(len(full_dataset) * 0.2))
+        train_size = len(full_dataset) - val_size
+        generator = torch.Generator().manual_seed(RANDOM_SEED or 42)
+        train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
+    else:
+        train_dataset, val_dataset = full_dataset, None
 
-    train_features, train_labels = [], []
-    val_features, val_labels = [], []
-    for feat, lab, stem in zip(features, labels, video_ids):
-        if stem in val_videos:
-            val_features.append(feat)
-            val_labels.append(lab)
-        else:
-            train_features.append(feat)
-            train_labels.append(lab)
+    train_loader = DataLoader(train_dataset, batch_size=WORD_CLASSIFIER_BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=WORD_CLASSIFIER_BATCH_SIZE, shuffle=False) if val_dataset else None
 
-    print(f"[*] 분리 완료: 학습 {len(train_features)}개 / 검증 {len(val_features)}개 "
-          f"(영상 {len(unique_videos) - n_val_videos} / {n_val_videos})")
-
-    train_loader = DataLoader(
-        SignDataset(train_features, train_labels),
-        batch_size=WORD_CLASSIFIER_BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(
-        SignDataset(val_features, val_labels),
-        batch_size=max(WORD_CLASSIFIER_BATCH_SIZE, 64), shuffle=False, num_workers=0)
-
-    num_classes = len(label2id)
-    id2label = {i: w for w, i in label2id.items()}
-
-    model = SignLanguageClassifier(input_dim=INPUT_DIM, num_classes=num_classes).to(device)
+    model = SignLanguageClassifier(input_dim=INPUT_DIM, num_classes=len(label2id)).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
-    print(f"\n[*] 실데이터 기반 단어 분류 모델 학습 시작... (클래스 {num_classes}개)")
-    model.train()
-    best_val_acc = -1.0
-
+    best_acc = -1.0
     for epoch in range(1, WORD_CLASSIFIER_EPOCHS + 1):
-        epoch_start = time.time()
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        model.train()
+        total_loss, correct, total = 0.0, 0, 0
 
         for batch_x, batch_y in train_loader:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-
             optimizer.zero_grad()
             outputs = model(batch_x)
             loss = criterion(outputs, batch_y)
@@ -275,34 +239,33 @@ def train_word_classifier():
             optimizer.step()
 
             total_loss += loss.item() * batch_x.size(0)
-            preds = torch.argmax(outputs, dim=1)
-            correct += (preds == batch_y).sum().item()
+            correct += (torch.argmax(outputs, dim=1) == batch_y).sum().item()
             total += batch_y.size(0)
 
-        epoch_loss = total_loss / total
-        epoch_acc = (correct / total) * 100
+        train_loss = total_loss / total
+        train_acc = (correct / total) * 100.0
 
-        val_loss, val_acc, per_class = evaluate(model, val_loader, device, num_classes)
+        if val_loader:
+            model.eval()
+            val_correct, val_total = 0, 0
+            with torch.no_grad():
+                for vx, vy in val_loader:
+                    vx, vy = vx.to(device), vy.to(device)
+                    v_out = model(vx)
+                    val_correct += (torch.argmax(v_out, dim=1) == vy).sum().item()
+                    val_total += vy.size(0)
+            val_acc = (val_correct / val_total) * 100.0
+            print(f"Epoch [{epoch:02d}/{WORD_CLASSIFIER_EPOCHS}] - Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
+            score_acc = val_acc
+        else:
+            print(f"Epoch [{epoch:02d}/{WORD_CLASSIFIER_EPOCHS}] - Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+            score_acc = train_acc
 
-        message = (f"Epoch [{epoch}/{WORD_CLASSIFIER_EPOCHS}] - Loss: {epoch_loss:.4f} | "
-                   f"Train: {epoch_acc:.2f}% | Val Loss: {val_loss:.4f} | Val: {val_acc:.2f}%")
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        if score_acc >= best_acc:
+            best_acc = score_acc
             torch.save(model.state_dict(), SIGN_MODEL_PATH)
-            message += " | 최고 가중치 저장"
 
-        print(message + f" | {time.time() - epoch_start:.1f}s")
-
-    _, final_val_acc, final_per_class = evaluate(model, val_loader, device, num_classes)
-
-    print(f"\n[v] 학습 완료. 최고 검증 정확도: {best_val_acc:.2f}% | 마지막 검증 정확도: {final_val_acc:.2f}%")
-    print(f"[v] 모델 가중치(검증 최고): {SIGN_MODEL_PATH}")
-
-    weakest = sorted(final_per_class.items(), key=lambda kv: kv[1])[:10]
-    print("[i] 검증 정확도 하위 10개 클래스:")
-    for idx, acc in weakest:
-        print(f"    {id2label.get(idx, idx)}: {acc:.1f}%")
+    print(f"[v] 학습 완료 (최고 정확도: {best_acc:.2f}%) -> {SIGN_MODEL_PATH}")
 
 
 if __name__ == "__main__":

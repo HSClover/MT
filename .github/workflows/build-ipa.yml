@@ -1,0 +1,48 @@
+name: Build iPadOS IPA
+
+on:
+  push:
+    paths:
+      - "ios_app/**"
+      - ".github/workflows/build-ipa.yml"
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        working-directory: ios_app
+        run: xcodegen generate
+
+      - name: Build Unsigned iOS App
+        working-directory: ios_app
+        run: |
+          xcodebuild -project SignTranslatorApp.xcodeproj \
+            -scheme SignTranslatorApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package IPA
+        working-directory: ios_app
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/SignTranslatorApp.app Payload/
+          zip -r SignTranslatorApp.ipa Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SignTranslatorApp-IPA
+          path: ios_app/SignTranslatorApp.ipa
