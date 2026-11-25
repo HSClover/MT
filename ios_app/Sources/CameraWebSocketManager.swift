@@ -62,7 +62,7 @@ final class CameraWebSocketManager: NSObject, ObservableObject {
                 if connection.isVideoOrientationSupported {
                     connection.videoOrientation = .portrait
                 }
-                if connection.isVideoMirroredSupported {
+                if connection.isVideoMirroringSupported {
                     connection.isVideoMirrored = true
                 }
             }
@@ -141,7 +141,7 @@ extension CameraWebSocketManager: URLSessionWebSocketDelegate {
         }
     }
 
-    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketCloseCode, reason: Data?) {
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         DispatchQueue.main.async {
             self.isConnected = false
             self.statusText = "서버 연결 닫힘"
